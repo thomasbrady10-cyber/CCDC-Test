@@ -1,0 +1,17 @@
+[Unit]
+Description=Warden CCDC Host Defense & Intrusion Monitor
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/warden
+ExecStart=/usr/bin/python3 /usr/local/bin/warden_daemon.py
+Restart=always
+RestartSec=3
+StandardOutput=append:/opt/warden/warden.log
+StandardError=append:/opt/warden/warden.log
+
+[Install]
+WantedBy=multi-user.target
