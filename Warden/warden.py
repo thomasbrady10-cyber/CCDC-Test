@@ -252,9 +252,11 @@ def init_db_and_deploy():
     (WARDEN_DIR / "quarantine").mkdir(exist_ok=True)
     os.chmod(WARDEN_DIR / "quarantine", 0o600)
 
-    run_cmd(
-        ["restorecon", "-Rv", "/opt/warden", "/usr/bin/warden_daemon.py", "/usr/bin/gatekeeper", "/etc/systemd/system"],
-        check=False,
+    if shutil.which("restorecon"):
+        run_cmd(
+            ["restorecon", "-Rv", "/opt/warden", "/usr/bin/warden_daemon.py", "/usr/bin/gatekeeper", "/etc/systemd/system"],
+            check=False,
+        )
     )
     run_cmd(["systemctl", "daemon-reload"], check=True)
     run_cmd(["systemctl", "enable", "--now", "warden.service"], check=True)
