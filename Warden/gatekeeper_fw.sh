@@ -1,5 +1,4 @@
 #!/bin/bash
-in/env bash
 set -euo pipefail
 
 TCP_PORTS="${ALLOWED_TCP_PORTS:-}"
