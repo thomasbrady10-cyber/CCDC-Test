@@ -27,6 +27,7 @@ import logging
 import subprocess
 from pathlib import Path
 
+SCRIPT_DIR = Path(__file__).resolve().parent
 WARDEN_DIR = Path("/opt/warden")
 DB_PATH = WARDEN_DIR / "warden.db"
 LOG_PATH = WARDEN_DIR / "warden.log"
@@ -55,7 +56,7 @@ HOST_PROFILES = {
         "role": "Debian Splunk Server (172.20.240.20)",
         "pkg_mgr": "apt-get",
         "tcp_ports": [22, 8000, 8089, 9997],
-        "udp_ports": [123],  # Scored splunk-chrony service
+        "udp_ports": [123],
         "is_splunk_indexer": True,
         "audit_log": "/var/log/auth.log",
     },
@@ -102,7 +103,11 @@ def prologue():
 
     init_env()
     detected = detect_distro()
-    prompt = f"Select Server {list(HOST_PROFILES.keys())} [{detected}]: " if detected else f"Select Server {list(HOST_PROFILES.keys())}: "
+    prompt = (
+        f"Select Server {list(HOST_PROFILES.keys())} [{detected}]: "
+        if detected
+        else f"Select Server {list(HOST_PROFILES.keys())}: "
+    )
 
     while server not in HOST_PROFILES:
         choice = input(prompt).strip().lower()
@@ -199,14 +204,18 @@ def init_db_and_deploy():
     for p in profile["udp_ports"]:
         cur.execute("INSERT OR IGNORE INTO accepted_ports (port, protocol) VALUES (?, 'udp')", (p,))
 
-    core_users = ["root", "sysadmin", "nobody", "splunk", "splunkfwd", "mysql", "mariadb",
-                  "www-data", "apache", "nginx", "postfix", "dovecot", "vmail"]
+    core_users = [
+        "root", "sysadmin", "nobody", "splunk", "splunkfwd", "mysql", "mariadb",
+        "www-data", "apache", "nginx", "postfix", "dovecot", "vmail",
+    ]
     for u in core_users:
         cur.execute("INSERT OR IGNORE INTO allowed_users (name) VALUES (?)", (u,))
 
-    core_services = ["warden.service", "nftables.service", "sshd.service", "ssh.service",
-                     "chrony.service", "Splunkd.service", "SplunkForwarder.service",
-                     "httpd.service", "apache2.service", "nginx.service", "postfix.service", "dovecot.service"]
+    core_services = [
+        "warden.service", "nftables.service", "sshd.service", "ssh.service",
+        "chrony.service", "Splunkd.service", "SplunkForwarder.service",
+        "httpd.service", "apache2.service", "nginx.service", "postfix.service", "dovecot.service",
+    ]
     for s in core_services:
         cur.execute("INSERT OR IGNORE INTO allowed_services (name) VALUES (?)", (s,))
 
@@ -216,30 +225,37 @@ def init_db_and_deploy():
     conn.close()
     os.chmod(DB_PATH, 0o600)
 
-    # Deploy background daemon & interactive CLI
-  script_dir = Path(__file__).resolve().parent
-
-    daemon_src = script_dir / "warden_daemon.py"
+    # Deploy background daemon & interactive CLI directly into /usr/bin
+    daemon_src = SCRIPT_DIR / "warden_daemon.py"
     if daemon_src.exists():
         shutil.copy(str(daemon_src), "/usr/bin/warden_daemon.py")
         os.chmod("/usr/bin/warden_daemon.py", 0o700)
+    else:
+        print(f"ERROR: {daemon_src} not found!")
 
-    cli_src = script_dir / "gatekeeper.py"
+    cli_src = SCRIPT_DIR / "gatekeeper.py"
     if cli_src.exists():
         shutil.copy(str(cli_src), "/usr/bin/gatekeeper")
         os.chmod("/usr/bin/gatekeeper", 0o700)
         if not os.path.exists("/usr/local/bin/gatekeeper"):
             os.symlink("/usr/bin/gatekeeper", "/usr/local/bin/gatekeeper")
+    else:
+        print(f"ERROR: {cli_src} not found!")
 
-    svc_src = script_dir / "warden.service"
+    svc_src = SCRIPT_DIR / "warden.service"
     if svc_src.exists():
         shutil.copy(str(svc_src), "/etc/systemd/system/warden.service")
         os.chmod("/etc/systemd/system/warden.service", 0o644)
+    else:
+        print(f"ERROR: {svc_src} not found!")
 
     (WARDEN_DIR / "quarantine").mkdir(exist_ok=True)
     os.chmod(WARDEN_DIR / "quarantine", 0o600)
 
-    run_cmd(["restorecon", "-Rv", "/opt/warden", "/usr/local/bin", "/etc/systemd/system"], check=False)
+    run_cmd(
+        ["restorecon", "-Rv", "/opt/warden", "/usr/bin/warden_daemon.py", "/usr/bin/gatekeeper", "/etc/systemd/system"],
+        check=False,
+    )
     run_cmd(["systemctl", "daemon-reload"], check=True)
     run_cmd(["systemctl", "enable", "--now", "warden.service"], check=True)
     logging.info("Warden SQLite DB, CLI (gatekeeper), and daemon deployed.")
@@ -252,9 +268,9 @@ def enforce_firewall():
         run_cmd(["systemctl", "disable", fw], check=False)
         run_cmd(["systemctl", "mask", fw], check=False)
 
-    fw_script = Path("./gatekeeper_fw.sh")
+    fw_script = SCRIPT_DIR / "gatekeeper_fw.sh"
     if not fw_script.exists():
-        print("ERROR: ./gatekeeper_fw.sh not found!")
+        print(f"ERROR: {fw_script} not found!")
         sys.exit(1)
 
     os.chmod(fw_script, 0o700)
@@ -264,7 +280,7 @@ def enforce_firewall():
     env["ALLOWED_TCP_PORTS"] = ",".join(str(p) for p in profile["tcp_ports"])
     env["ALLOWED_UDP_PORTS"] = ",".join(str(p) for p in profile["udp_ports"])
 
-    subprocess.run(["/bin/bash", str(fw_script)], env=env, check=True)
+    subprocess.run([str(fw_script)], env=env, check=True)
     logging.info("Firewall enforced via gatekeeper_fw.sh.")
 
 
@@ -323,10 +339,14 @@ def main():
     if len(sys.argv) > 1:
         flag = sys.argv[1]
         actions = {
-            "-p": rotate_passwords, "--passwords": rotate_passwords,
-            "-f": enforce_firewall, "--firewall": enforce_firewall,
-            "-s": configure_splunk, "--splunk": configure_splunk,
-            "-v": verify_health, "--verify": verify_health,
+            "-p": rotate_passwords,
+            "--passwords": rotate_passwords,
+            "-f": enforce_firewall,
+            "--firewall": enforce_firewall,
+            "-s": configure_splunk,
+            "--splunk": configure_splunk,
+            "-v": verify_health,
+            "--verify": verify_health,
         }
         if flag in actions:
             actions[flag]()
