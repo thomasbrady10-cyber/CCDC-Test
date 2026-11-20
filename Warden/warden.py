@@ -217,16 +217,23 @@ def init_db_and_deploy():
     os.chmod(DB_PATH, 0o600)
 
     # Deploy background daemon & interactive CLI
-    if Path("warden_daemon.py").exists():
-        shutil.copy("warden_daemon.py", "/usr/local/bin/warden_daemon.py")
-        os.chmod("/usr/local/bin/warden_daemon.py", 0o700)
+   script_dir = Path(__file__).resolve().parent
 
-    if Path("gatekeeper.py").exists():
-        shutil.copy("gatekeeper.py", "/usr/local/bin/gatekeeper")
-        os.chmod("/usr/local/bin/gatekeeper", 0o700)
+    daemon_src = script_dir / "warden_daemon.py"
+    if daemon_src.exists():
+        shutil.copy(str(daemon_src), "/usr/bin/warden_daemon.py")
+        os.chmod("/usr/bin/warden_daemon.py", 0o700)
 
-    if Path("warden.service").exists():
-        shutil.copy("warden.service", "/etc/systemd/system/warden.service")
+    cli_src = script_dir / "gatekeeper.py"
+    if cli_src.exists():
+        shutil.copy(str(cli_src), "/usr/bin/gatekeeper")
+        os.chmod("/usr/bin/gatekeeper", 0o700)
+        if not os.path.exists("/usr/local/bin/gatekeeper"):
+            os.symlink("/usr/bin/gatekeeper", "/usr/local/bin/gatekeeper")
+
+    svc_src = script_dir / "warden.service"
+    if svc_src.exists():
+        shutil.copy(str(svc_src), "/etc/systemd/system/warden.service")
         os.chmod("/etc/systemd/system/warden.service", 0o644)
 
     (WARDEN_DIR / "quarantine").mkdir(exist_ok=True)
