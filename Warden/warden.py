@@ -217,7 +217,7 @@ def init_db_and_deploy():
     os.chmod(DB_PATH, 0o600)
 
     # Deploy background daemon & interactive CLI
-    daemon_src = script_dir / "warden_daemon.py"
+    
     if daemon_src.exists():
         shutil.copy(str(daemon_src), "/usr/bin/warden_daemon.py")
         os.chmod("/usr/bin/warden_daemon.py", 0o700)
