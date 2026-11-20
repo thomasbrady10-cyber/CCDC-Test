@@ -245,10 +245,15 @@ def enforce_firewall():
         run_cmd(["systemctl", "disable", fw], check=False)
         run_cmd(["systemctl", "mask", fw], check=False)
 
-    fw_script = Path("./gatekeeper_fw.sh")
+   fw_script = Path(__file__).resolve().parent / "gatekeeper_fw.sh"
     if not fw_script.exists():
-        print("ERROR: ./gatekeeper_fw.sh not found!")
+        print(f"ERROR: {fw_script} not found!")
         sys.exit(1)
+
+    # Strip Windows CRLF (\r\n) bytes if present so bash never fails on \r
+    raw_bytes = fw_script.read_bytes()
+    if b"\r\n" in raw_bytes:
+        fw_script.write_bytes(raw_bytes.replace(b"\r\n", b"\n"))
 
     os.chmod(fw_script, 0o700)
     profile = HOST_PROFILES[server]
@@ -257,7 +262,7 @@ def enforce_firewall():
     env["ALLOWED_TCP_PORTS"] = ",".join(str(p) for p in profile["tcp_ports"])
     env["ALLOWED_UDP_PORTS"] = ",".join(str(p) for p in profile["udp_ports"])
 
-    subprocess.run(["/bin/bash", str(fw_script.resolve())], env=env, check=True)
+    subprocess.run(["/bin/bash", str(fw_script)], env=env, check=True)
     logging.info("Firewall enforced via gatekeeper_fw.sh.")
 
 
