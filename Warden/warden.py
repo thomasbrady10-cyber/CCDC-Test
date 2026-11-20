@@ -257,7 +257,7 @@ def enforce_firewall():
     env["ALLOWED_TCP_PORTS"] = ",".join(str(p) for p in profile["tcp_ports"])
     env["ALLOWED_UDP_PORTS"] = ",".join(str(p) for p in profile["udp_ports"])
 
-    subprocess.run([str(fw_script.resolve())], env=env, check=True)
+    subprocess.run(["/bin/bash", str(fw_script.resolve())], env=env, check=True)
     logging.info("Firewall enforced via gatekeeper_fw.sh.")
 
 
