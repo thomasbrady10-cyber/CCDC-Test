@@ -4,14 +4,15 @@
 GATEKEEPER — Live Firewall & Policy Admin CLI (/usr/local/bin/gatekeeper)
 ================================================================================
 Run `sudo gatekeeper` during the competition to:
-  - Immediately ban Red Team IPs or CIDR subnets into @blacklist
-  - Open/close TCP or UDP ports for injects
-  - Lock rogue users or quarantine rogue systemd services
+- Immediately ban Red Team IPs or CIDR subnets into @blacklist
+- Open/close TCP or UDP ports for injects
+- Lock rogue users or quarantine rogue systemd services
 ================================================================================
 """
 
 import os
 import sys
+import shutil
 import sqlite3
 import ipaddress
 import logging
@@ -23,7 +24,7 @@ if os.geteuid() != 0:
 
 DB_PATH = "/opt/warden/warden.db"
 LOG_PATH = "/opt/warden/warden.log"
-NFT_CONF = "/etc/sysconfig/nftables.conf"
+NFT_CONF = "/etc/sysconfig/nftables.conf" if os.path.isdir("/etc/sysconfig") else "/etc/nftables.conf"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -82,13 +83,29 @@ def reload_nftables():
 
     lines.extend([
         "    }",
-        "    chain forward { type filter hook forward priority 0; policy drop; }",
-        "    chain output { type filter hook output priority 0; policy accept; }",
+        "    chain forward {",
+        "        type filter hook forward priority 0;",
+        "        policy drop;",
+        "    }",
+        "    chain output {",
+        "        type filter hook output priority 0;",
+        "        policy drop;",
+        '        oif "lo" accept',
+        "        ct state established,related accept",
+        "        ct state invalid drop",
+        "        udp dport 53 accept",
+        "        tcp dport 53 accept",
+        "        udp dport 123 accept",
+        "        ip protocol icmp accept",
+        "        ip6 nexthdr icmpv6 accept",
+        "        tcp dport { 8089, 9997 } accept",
+        "        tcp dport { 80, 443 } accept",
+        "    }",
         "}",
         "",
     ])
 
-    tmp = "/etc/sysconfig/nftables.conf.tmp"
+    tmp = f"{NFT_CONF}.tmp"
     with open(tmp, "w") as f:
         f.write("\n".join(lines))
     os.chmod(tmp, 0o600)
@@ -100,6 +117,19 @@ def reload_nftables():
         return
 
     os.replace(tmp, NFT_CONF)
+
+    # Keep /etc/nftables.conf mirrored on RHEL/Rocky so both paths stay in sync
+    if NFT_CONF != "/etc/nftables.conf":
+        shutil.copy(NFT_CONF, "/etc/nftables.conf")
+        os.chmod("/etc/nftables.conf", 0o600)
+
+    if shutil.which("restorecon"):
+        subprocess.run(
+            ["restorecon", "-v", NFT_CONF, "/etc/nftables.conf"],
+            capture_output=True,
+            check=False,
+        )
+
     subprocess.run(["nft", "-f", NFT_CONF], check=True)
     print("[+] Firewall reloaded.")
 
