@@ -23,7 +23,7 @@ if os.geteuid() != 0:
 
 DB_PATH = "/opt/warden/warden.db"
 LOG_PATH = "/opt/warden/warden.log"
-NFT_CONF = "/etc/nftables.conf"
+NFT_CONF = "/etc/sysconfig/nftables.conf"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -88,7 +88,7 @@ def reload_nftables():
         "",
     ])
 
-    tmp = "/etc/nftables.conf.tmp"
+    tmp = "/etc/sysconfig/nftables.conf.tmp"
     with open(tmp, "w") as f:
         f.write("\n".join(lines))
     os.chmod(tmp, 0o600)
