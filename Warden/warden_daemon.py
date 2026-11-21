@@ -35,6 +35,10 @@ SUSPICIOUS_SHELL_BINARIES = {
 # Add your Splunk Indexer IP here so Splunk scripts aren't flagged
 TRUSTED_OUTBOUND_IPS = {"127.0.0.1", "::1"}
 
+baseline_users = set()
+baseline_crontab = ""
+seen_logins = set()
+
 
 def run_cmd(cmd):
     return subprocess.run(cmd, capture_output=True, text=True, check=False).stdout.strip()
@@ -95,7 +99,6 @@ def sweep():
             elif ip not in whitelist_ips:
                 logging.warning(f"SSH login observed: user={user} ip={ip} tty={tty}")
 
-    # 3. Reverse Shell Sweep
     # 3. Outbound Socket Reverse Shell & C2 Sweep
     my_pid = os.getpid()
     ss_out = run_cmd(["ss", "-tnap", "state", "established"])
@@ -110,7 +113,7 @@ def sweep():
         peer_ip = peer_addr.rsplit(":", 1)[0].strip("[]")
         local_port = local_addr.rsplit(":", 1)[-1]
 
-        if peer_ip in TRUSTED_OUTBOUND_IPS:
+        if peer_ip in TRUSTED_OUTBOUND_IPS or peer_ip in whitelist_ips:
             continue
 
         match = re.search(r'\(\("([^"]+)",pid=(\d+),', proc_info)
