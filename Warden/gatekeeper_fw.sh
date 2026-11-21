@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 TCP_PORTS="${ALLOWED_TCP_PORTS:-}"
@@ -52,9 +52,28 @@ cat <<'EOF' >> /etc/nftables.conf
         policy drop;
     }
 
+    # --- PART 2: DEFAULT-DENY OUTBOUND ---
     chain output {
         type filter hook output priority 0;
-        policy accept;
+        policy drop;
+
+        # Loopback & return traffic for valid inbound connections
+        oif "lo" accept
+        ct state established,related accept
+        ct state invalid drop
+
+        # Essential infrastructure (DNS, NTP, ICMP)
+        udp dport 53 accept
+        tcp dport 53 accept
+        udp dport 123 accept
+        ip protocol icmp accept
+        ip6 nexthdr icmpv6 accept
+
+        # Splunk Universal Forwarder (9997 ingestion, 8089 management)
+        tcp dport { 8089, 9997 } accept
+
+        # OS package updates / repositories (HTTP/HTTPS)
+        tcp dport { 80, 443 } accept
     }
 }
 EOF
@@ -62,6 +81,8 @@ EOF
 chmod 600 /etc/nftables.conf
 nft -c -f /etc/nftables.conf
 nft -f /etc/nftables.conf
+
+# --- PART 1: ROCKY / RHEL 9 REBOOT PERSISTENCE ---
 if [[ -d /etc/sysconfig ]]; then
     cp /etc/nftables.conf /etc/sysconfig/nftables.conf
     chmod 600 /etc/sysconfig/nftables.conf
@@ -69,5 +90,6 @@ if [[ -d /etc/sysconfig ]]; then
         restorecon -v /etc/nftables.conf /etc/sysconfig/nftables.conf >/dev/null 2>&1 || true
     fi
 fi
+
 systemctl enable --now nftables
 echo "[+] Gatekeeper firewall active | TCP={${TCP_PORTS:-none}} UDP={${UDP_PORTS:-none}}"
