@@ -8,6 +8,7 @@ Repository Layout (CCDC-Test/Warden/)
 * warden.service — Systemd service unit file installed to /etc/systemd/system/warden.service to keep warden_daemon.py running persistently.
 * .gitattributes — Forces Unix LF (\n) line endings for .sh, .py, and .service files so Windows CRLF line endings (\r\n) never break execution on Linux target hosts.
 Quick Start (Competition Day Workflow)
+
 1. One-Liner Deploy on Target Host
 Run as root (or with sudo) directly on the target Linux machine (Rocky Ecom, Ubuntu Email, or Debian Splunk):
 git clone https://github.com/thomasbrady10-cyber/CCDC-Test.git /opt/CCDC-Test && cd /opt/CCDC-Test/Warden && sudo python3 setup.py
@@ -18,6 +19,7 @@ Run as root (or with sudo) directly on the target Linux machine (Rocky Ecom, Ubu
 2. Password Rotation: Enter new, unique passwords for sysadmin and root (do not reuse credentials across hosts).
 3. Splunk Forwarder Credentials: Enter Splunk forwarder admin user/password (press Enter to default to admin).
 4. OS Package Upgrade: Enter N for fastest 10-second deployment (recommended at drop flag), or y to run system package updates.
+
 3. Modular CLI Flags (Optional)
 sudo python3 setup.py --passwords   # (-p) Rotate root & sysadmin passwords only
 sudo python3 setup.py --firewall    # (-f) Re-enforce gatekeeper_fw.sh only
@@ -53,9 +55,11 @@ Reboot Persistence (Rocky/RHEL 9 & Debian/Ubuntu)
 * Debian/Ubuntu reads /etc/nftables.conf on boot.
 * Rocky/RHEL 9 reads /etc/sysconfig/nftables.conf on boot.
 * Both gatekeeper_fw.sh and gatekeeper auto-detect RHEL systems, sync rules to /etc/sysconfig/nftables.conf, and apply SELinux context (restorecon) so firewall rules survive reboots.
+
 Default-Deny Outbound Traffic
 * Outbound policy is set to policy drop.
 * Only essential outbound traffic is permitted: Loopback (lo), Established/Related return sessions, DNS (UDP/TCP 53), NTP (UDP 123), ICMP pings, HTTP/HTTPS repositories (TCP 80, 443), and Splunk Indexer shipping (TCP 8089, 9997).
+
 Socket-Based Reverse Shell Detection
 * warden_daemon.py scans active ESTABLISHED TCP sockets via ss -tnap rather than relying on brittle process regex string matching.
 * Any interactive interpreter or shell (bash, sh, python3, nc, perl, ruby, php) holding an unauthorized outbound connection is immediately sent SIGKILL and logged with PID, local port, peer IP, and full /proc/<pid>/cmdline.
