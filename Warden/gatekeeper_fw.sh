@@ -62,5 +62,12 @@ EOF
 chmod 600 /etc/nftables.conf
 nft -c -f /etc/nftables.conf
 nft -f /etc/nftables.conf
+if [[ -d /etc/sysconfig ]]; then
+    cp /etc/nftables.conf /etc/sysconfig/nftables.conf
+    chmod 600 /etc/sysconfig/nftables.conf
+    if command -v restorecon >/dev/null 2>&1; then
+        restorecon -v /etc/nftables.conf /etc/sysconfig/nftables.conf >/dev/null 2>&1 || true
+    fi
+fi
 systemctl enable --now nftables
 echo "[+] Gatekeeper firewall active | TCP={${TCP_PORTS:-none}} UDP={${UDP_PORTS:-none}}"
