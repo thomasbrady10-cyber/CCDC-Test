@@ -26,18 +26,14 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - [DAEMON] %(message)s",
 )
 
-REVERSE_SHELLS = [
-    re.compile(r"/bin/(ba)?sh\s+-i\b"),
-    re.compile(r"\bnc\b.*(-e|-c)\b"),
-    re.compile(r"\bncat\b.*(-e|--exec|--sh-exec)\b"),
-    re.compile(r"\bsocat\b.*EXEC:", re.IGNORECASE),
-    re.compile(r"python3?\s+-c\s+['\"].*socket.*subprocess", re.IGNORECASE),
-    re.compile(r"/dev/tcp/\d+\.\d+\.\d+\.\d+/\d+"),
-]
+SUSPICIOUS_SHELL_BINARIES = {
+    "bash", "sh", "dash", "zsh", "ash", "ksh",
+    "nc", "ncat", "netcat", "socat",
+    "python", "python3", "perl", "ruby", "php",
+}
 
-baseline_users = set()
-baseline_crontab = ""
-seen_logins = set()
+# Add your Splunk Indexer IP here so Splunk scripts aren't flagged
+TRUSTED_OUTBOUND_IPS = {"127.0.0.1", "::1"}
 
 
 def run_cmd(cmd):
@@ -100,17 +96,45 @@ def sweep():
                 logging.warning(f"SSH login observed: user={user} ip={ip} tty={tty}")
 
     # 3. Reverse Shell Sweep
+    # 3. Outbound Socket Reverse Shell & C2 Sweep
     my_pid = os.getpid()
-    for line in run_cmd(["ps", "-eo", "pid,user,args"]).splitlines()[1:]:
-        parts = line.strip().split(None, 2)
-        if len(parts) == 3 and int(parts[0]) != my_pid:
-            pid, p_user, cmd = int(parts[0]), parts[1], parts[2]
-            if any(rx.search(cmd) for rx in REVERSE_SHELLS):
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                    logging.error(f"KILLED reverse shell PID={pid} USER={p_user} CMD='{cmd}'")
-                except ProcessLookupError:
-                    pass
+    ss_out = run_cmd(["ss", "-tnap", "state", "established"])
+    for line in ss_out.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+
+        local_addr, peer_addr = parts[2], parts[3]
+        proc_info = " ".join(parts[4:])
+
+        peer_ip = peer_addr.rsplit(":", 1)[0].strip("[]")
+        local_port = local_addr.rsplit(":", 1)[-1]
+
+        if peer_ip in TRUSTED_OUTBOUND_IPS:
+            continue
+
+        match = re.search(r'\(\("([^"]+)",pid=(\d+),', proc_info)
+        if not match:
+            continue
+
+        comm, pid_str = match.group(1), match.group(2)
+        pid = int(pid_str)
+
+        # Kill any shell/interpreter holding an active external socket (excluding inbound SSH on port 22)
+        if pid != my_pid and comm in SUSPICIOUS_SHELL_BINARIES and local_port != "22":
+            try:
+                cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\x00", b" ").decode(errors="ignore").strip()
+            except Exception:
+                cmdline = comm
+
+            try:
+                os.kill(pid, signal.SIGKILL)
+                logging.error(
+                    f"KILLED reverse shell socket PID={pid} BIN={comm} "
+                    f"LOCAL={local_addr} PEER={peer_addr} CMD='{cmdline}'"
+                )
+            except (ProcessLookupError, PermissionError) as err:
+                logging.error(f"Failed to kill PID={pid} ({comm}) -> {peer_addr}: {err}")
 
     # 4. Crontab Integrity
     cron = Path("/etc/crontab")
