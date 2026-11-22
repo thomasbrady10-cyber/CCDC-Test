@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-WARDEN — MWCCDC Rapid Linux Hardening & Deployment Suite (warden.py)
+WARDEN SETUP — CCDC Rapid Linux Hardening & Deployment Suite (setup.py)
 ================================================================================
-Deploys in <15 seconds using Python 3 stdlib + SQLite (zero pip/gcc/MariaDB lag).
-Covers:
-  - Rocky Ecom    (172.20.240.10): TCP 80, 443 + ICMP
-  - Ubuntu Email  (172.20.240.15): TCP 22, 25, 80, 110, 143, 443, 587, 993, 995 + ICMP
-  - Debian Splunk (172.20.240.20): TCP 22, 8000, 8089, 9997 | UDP 123 (Chrony) + ICMP
+PURPOSE:
+    Deploys in <15 seconds using Python 3 stdlib + SQLite (zero pip/gcc/MariaDB lag).
+    Covers:
+      - Rocky Ecom    (172.20.240.10): TCP 80, 443 + ICMP
+      - Ubuntu Email  (172.20.240.15): TCP 22, 25, 80, 110, 143, 443, 587, 993, 995 + ICMP
+      - Debian Splunk (172.20.240.20): TCP 22, 8000, 8089, 9997 | UDP 123 (Chrony) + ICMP
 
-Usage:
-  sudo python3 warden.py              # Full rapid deployment
-  sudo python3 warden.py --passwords  # Rotate root & sysadmin passwords only
-  sudo python3 warden.py --firewall   # Re-apply gatekeeper_fw.sh only
-  sudo python3 warden.py --splunk     # Configure Splunk forwarder only
-  sudo python3 warden.py --verify     # Verify active scored & defense services
+USAGE:
+    sudo python3 setup.py              # Full rapid deployment
+    sudo python3 setup.py --passwords  # Rotate root & sysadmin passwords only (-p)
+    sudo python3 setup.py --firewall   # Re-apply gatekeeper_fw.sh only (-f)
+    sudo python3 setup.py --splunk     # Configure Splunk forwarder only (-s)
+    sudo python3 setup.py --verify     # Verify active scored & defense services (-v)
 ================================================================================
 """
 
@@ -27,7 +28,13 @@ import logging
 import subprocess
 from pathlib import Path
 
+# ------------------------------------------------------------------------------
+# GLOBAL PATHS & SPLUNK TARGET CONSTANTS
+# ------------------------------------------------------------------------------
+# Resolve the directory containing setup.py so companion files are found even
+# if the operator invokes `sudo python3 /path/to/setup.py` from another folder.
 SCRIPT_DIR = Path(__file__).resolve().parent
+
 WARDEN_DIR = Path("/opt/warden")
 DB_PATH = WARDEN_DIR / "warden.db"
 LOG_PATH = WARDEN_DIR / "warden.log"
@@ -35,6 +42,9 @@ LOG_PATH = WARDEN_DIR / "warden.log"
 SPLUNK_INDEXER_IP = "172.20.240.20"
 SPLUNK_FORWARD_PORT = "9997"
 
+# ------------------------------------------------------------------------------
+# CCDC HOST TOPOLOGY PROFILES
+# ------------------------------------------------------------------------------
 HOST_PROFILES = {
     "rocky": {
         "role": "Rocky Ecom (172.20.240.10)",
@@ -56,12 +66,13 @@ HOST_PROFILES = {
         "role": "Debian Splunk Server (172.20.240.20)",
         "pkg_mgr": "apt-get",
         "tcp_ports": [22, 8000, 8089, 9997],
-        "udp_ports": [123],
+        "udp_ports": [123],  # Scored splunk-chrony NTP service
         "is_splunk_indexer": True,
         "audit_log": "/var/log/auth.log",
     },
 }
 
+# Interactive answers collected during prologue()
 server = ""
 sysadmin_pass = ""
 root_pass = ""
@@ -71,10 +82,12 @@ run_sys_upgrade = False
 
 
 def run_cmd(cmd, input_text=None, check=True):
+    """Execute a subprocess safely without a shell and return CompletedProcess."""
     return subprocess.run(cmd, input=input_text, capture_output=True, text=True, check=check)
 
 
 def detect_distro():
+    """Auto-detect rocky, ubuntu, or debian from /etc/os-release."""
     if os.path.exists("/etc/os-release"):
         data = Path("/etc/os-release").read_text().lower()
         for distro in HOST_PROFILES:
@@ -84,6 +97,7 @@ def detect_distro():
 
 
 def init_env():
+    """Create /opt/warden (mode 0700) and configure append-only logging."""
     WARDEN_DIR.mkdir(parents=True, exist_ok=True)
     os.chmod(WARDEN_DIR, 0o700)
     logging.basicConfig(
@@ -95,10 +109,11 @@ def init_env():
 
 
 def prologue():
+    """Verify root privileges and collect host profile, passwords, and Splunk creds."""
     global server, sysadmin_pass, root_pass, splunk_user, splunk_pass, run_sys_upgrade
 
     if os.geteuid() != 0:
-        print("ERROR: Run as root (sudo python3 warden.py).")
+        print("ERROR: Run as root (sudo python3 setup.py).")
         sys.exit(1)
 
     init_env()
@@ -116,18 +131,21 @@ def prologue():
     profile = HOST_PROFILES[server]
     print(f"\n>>> Deploying WARDEN on {profile['role']} <<<")
 
+    # Collect new 'sysadmin' password
     while True:
         sysadmin_pass = getpass.getpass("Enter NEW 'sysadmin' password: ")
         if sysadmin_pass and sysadmin_pass == getpass.getpass("Confirm 'sysadmin' password: "):
             break
         print("Mismatch or empty. Try again.")
 
+    # Collect new 'root' password
     while True:
         root_pass = getpass.getpass("Enter NEW 'root' password: ")
         if root_pass and root_pass == getpass.getpass("Confirm 'root' password: "):
             break
         print("Mismatch or empty. Try again.")
 
+    # Collect Splunk Forwarder credentials on non-indexer hosts
     if not profile["is_splunk_indexer"]:
         splunk_user = input("Splunk Forwarder Admin User [admin]: ").strip() or "admin"
         splunk_pass = getpass.getpass("Splunk Forwarder Password: ")
@@ -136,7 +154,11 @@ def prologue():
     run_sys_upgrade = (ans == "y")
 
 
+# ------------------------------------------------------------------------------
+# STEP 1: ROTATE LOCAL PASSWORDS
+# ------------------------------------------------------------------------------
 def rotate_passwords():
+    """Rotate root and sysadmin passwords via `chpasswd` over stdin."""
     print("[1/5] Rotating 'root' and 'sysadmin' passwords...")
     payload = f"root:{root_pass}\n"
     if run_cmd(["id", "sysadmin"], check=False).returncode == 0:
@@ -145,7 +167,11 @@ def rotate_passwords():
     logging.info("Rotated root and sysadmin passwords.")
 
 
+# ------------------------------------------------------------------------------
+# STEP 2: SYNC TIME & ENSURE NFTABLES IS INSTALLED
+# ------------------------------------------------------------------------------
 def ensure_base_tools():
+    """Enable NTP time sync, start chrony on Debian, and ensure nftables exists."""
     print("[2/5] Syncing time & ensuring nftables is present...")
     run_cmd(["timedatectl", "set-ntp", "true"], check=False)
     if server == "debian":
@@ -164,7 +190,15 @@ def ensure_base_tools():
             run_cmd(["dnf", "install", "-y", "nftables"], check=True)
 
 
+# ------------------------------------------------------------------------------
+# STEP 3: INITIALIZE SQLITE POLICY DB & DEPLOY DAEMON / CLI
+# ------------------------------------------------------------------------------
 def init_db_and_deploy():
+    """
+    Create /opt/warden/warden.db, seed scored ports/users/services, install
+    warden_daemon.py and gatekeeper into /usr/bin (with /usr/local/bin symlink),
+    and start warden.service.
+    """
     print("[3/5] Initializing /opt/warden/warden.db & deploying daemon/CLI...")
     conn = sqlite3.connect(str(DB_PATH))
     cur = conn.cursor()
@@ -225,13 +259,11 @@ def init_db_and_deploy():
     conn.close()
     os.chmod(DB_PATH, 0o600)
 
-    # Deploy background daemon & interactive CLI directly into /usr/bin
+    # Install daemon and CLI into /usr/bin (covered by Rocky sudo secure_path & SELinux)
     daemon_src = SCRIPT_DIR / "warden_daemon.py"
     if daemon_src.exists():
         shutil.copy(str(daemon_src), "/usr/bin/warden_daemon.py")
         os.chmod("/usr/bin/warden_daemon.py", 0o700)
-    else:
-        print(f"ERROR: {daemon_src} not found!")
 
     cli_src = SCRIPT_DIR / "gatekeeper.py"
     if cli_src.exists():
@@ -239,30 +271,31 @@ def init_db_and_deploy():
         os.chmod("/usr/bin/gatekeeper", 0o700)
         if not os.path.exists("/usr/local/bin/gatekeeper"):
             os.symlink("/usr/bin/gatekeeper", "/usr/local/bin/gatekeeper")
-    else:
-        print(f"ERROR: {cli_src} not found!")
 
     svc_src = SCRIPT_DIR / "warden.service"
     if svc_src.exists():
         shutil.copy(str(svc_src), "/etc/systemd/system/warden.service")
         os.chmod("/etc/systemd/system/warden.service", 0o644)
-    else:
-        print(f"ERROR: {svc_src} not found!")
 
     (WARDEN_DIR / "quarantine").mkdir(exist_ok=True)
     os.chmod(WARDEN_DIR / "quarantine", 0o600)
 
-    if shutil.which("restorecon"):
-        run_cmd(
-            ["restorecon", "-Rv", "/opt/warden", "/usr/bin/warden_daemon.py", "/usr/bin/gatekeeper", "/etc/systemd/system"],
-            check=False,
-        )
+    # Restore SELinux file contexts on Rocky/RHEL
+    run_cmd(
+        ["restorecon", "-Rv", "/opt/warden", "/usr/bin/warden_daemon.py",
+         "/usr/bin/gatekeeper", "/etc/systemd/system/warden.service"],
+        check=False,
+    )
     run_cmd(["systemctl", "daemon-reload"], check=True)
     run_cmd(["systemctl", "enable", "--now", "warden.service"], check=True)
     logging.info("Warden SQLite DB, CLI (gatekeeper), and daemon deployed.")
 
 
+# ------------------------------------------------------------------------------
+# STEP 4: MASK UFW/FIREWALLD & ENFORCE GATEKEEPER_FW.SH
+# ------------------------------------------------------------------------------
 def enforce_firewall():
+    """Disable conflicting firewalls, normalize LF endings, and run gatekeeper_fw.sh."""
     print("[4/5] Masking ufw/firewalld & enforcing gatekeeper_fw.sh...")
     for fw in ["ufw", "firewalld"]:
         run_cmd(["systemctl", "stop", fw], check=False)
@@ -274,6 +307,11 @@ def enforce_firewall():
         print(f"ERROR: {fw_script} not found!")
         sys.exit(1)
 
+    # Strip Windows CRLF (\r\n) bytes automatically so bash never throws \r errors
+    raw_bytes = fw_script.read_bytes()
+    if b"\r\n" in raw_bytes:
+        fw_script.write_bytes(raw_bytes.replace(b"\r\n", b"\n"))
+
     os.chmod(fw_script, 0o700)
     profile = HOST_PROFILES[server]
     env = os.environ.copy()
@@ -281,11 +319,16 @@ def enforce_firewall():
     env["ALLOWED_TCP_PORTS"] = ",".join(str(p) for p in profile["tcp_ports"])
     env["ALLOWED_UDP_PORTS"] = ",".join(str(p) for p in profile["udp_ports"])
 
-    subprocess.run([str(fw_script)], env=env, check=True)
+    # Invoke /bin/bash explicitly to prevent kernel 'Exec format error'
+    subprocess.run(["/bin/bash", str(fw_script)], env=env, check=True)
     logging.info("Firewall enforced via gatekeeper_fw.sh.")
 
 
+# ------------------------------------------------------------------------------
+# STEP 5: CONFIGURE SPLUNK UNIVERSAL FORWARDER
+# ------------------------------------------------------------------------------
 def configure_splunk():
+    """Seed Splunk Universal Forwarder admin user, forward-server, and log monitors."""
     print("[5/5] Configuring Splunk Universal Forwarder...")
     if HOST_PROFILES[server]["is_splunk_indexer"]:
         print("      Host is Debian Splunk Indexer — skipping forwarder setup.")
@@ -323,7 +366,11 @@ def configure_splunk():
     logging.info(f"Splunk forwarder configured -> {target}")
 
 
+# ------------------------------------------------------------------------------
+# POST-DEPLOY HEALTH CHECK
+# ------------------------------------------------------------------------------
 def verify_health():
+    """Print active status for nftables, warden.service, and chrony (Debian)."""
     print("\n=== WARDEN POST-DEPLOY STATUS ===")
     services = ["nftables.service", "warden.service"]
     if server == "debian":
@@ -340,14 +387,10 @@ def main():
     if len(sys.argv) > 1:
         flag = sys.argv[1]
         actions = {
-            "-p": rotate_passwords,
-            "--passwords": rotate_passwords,
-            "-f": enforce_firewall,
-            "--firewall": enforce_firewall,
-            "-s": configure_splunk,
-            "--splunk": configure_splunk,
-            "-v": verify_health,
-            "--verify": verify_health,
+            "-p": rotate_passwords, "--passwords": rotate_passwords,
+            "-f": enforce_firewall, "--firewall": enforce_firewall,
+            "-s": configure_splunk, "--splunk": configure_splunk,
+            "-v": verify_health, "--verify": verify_health,
         }
         if flag in actions:
             actions[flag]()
