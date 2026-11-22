@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-GATEKEEPER — Live Firewall & Policy Admin CLI (/usr/local/bin/gatekeeper)
+GATEKEEPER — Live Firewall & Policy Admin CLI (/usr/bin/gatekeeper)
 ================================================================================
-Run `sudo gatekeeper` during the competition to:
-- Immediately ban Red Team IPs or CIDR subnets into @blacklist
-- Open/close TCP or UDP ports for injects
-- Lock rogue users or quarantine rogue systemd services
+PURPOSE:
+    Provides a safe, menu-driven interface for Blue Team operators during
+    the competition so nobody has to hand-edit nftables.conf under pressure.
+
+HOW IT WORKS:
+    1. All changes (banned IPs, whitelisted IPs, open/closed ports, blocked
+       users/services) are stored atomically in /opt/warden/warden.db.
+    2. Whenever network rules change, reload_nftables() regenerates a clean
+       nftables ruleset from the database, validates syntax with `nft -c -f`,
+       syncs both /etc/sysconfig/nftables.conf (Rocky) and /etc/nftables.conf
+       (Debian/Ubuntu), and reloads the kernel firewall.
+    3. Every action is logged to /opt/warden/warden.log for Incident Reports.
 ================================================================================
 """
 
@@ -18,12 +26,16 @@ import ipaddress
 import logging
 import subprocess
 
+# Enforce root execution so sqlite3 DB writes and `nft` reloads succeed
 if os.geteuid() != 0:
     print("ERROR: Run as root (sudo gatekeeper).")
     sys.exit(1)
 
 DB_PATH = "/opt/warden/warden.db"
 LOG_PATH = "/opt/warden/warden.log"
+
+# Rocky/RHEL loads boot rules from /etc/sysconfig/nftables.conf; Debian/Ubuntu
+# uses /etc/nftables.conf. Detect primary path automatically.
 NFT_CONF = "/etc/sysconfig/nftables.conf" if os.path.isdir("/etc/sysconfig") else "/etc/nftables.conf"
 
 logging.basicConfig(
@@ -33,11 +45,13 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - [GATEKEEPER] %(message)s",
 )
 
+# Open persistent SQLite connection to the shared WARDEN policy database
 conn = sqlite3.connect(DB_PATH)
 cur = conn.cursor()
 
 
 def is_valid_net(val):
+    """Validate that user input is a legitimate IPv4/IPv6 address or CIDR block."""
     try:
         ipaddress.ip_network(val, strict=False)
         return True
@@ -46,11 +60,19 @@ def is_valid_net(val):
 
 
 def reload_nftables():
+    """
+    Rebuild the nftables configuration from warden.db, validate syntax before
+    applying, mirror across Rocky/Debian config paths, and reload the kernel.
+    """
+    # Query current active ports and IP sets from SQLite
     tcp_ports = [str(r[0]) for r in cur.execute("SELECT port FROM accepted_ports WHERE protocol='tcp' ORDER BY port")]
     udp_ports = [str(r[0]) for r in cur.execute("SELECT port FROM accepted_ports WHERE protocol='udp' ORDER BY port")]
+
+    # nftables requires at least one element in a named set; fall back to RFC 5737 dummy IPs
     bl_ips = [r[0] for r in cur.execute("SELECT ip FROM blacklist ORDER BY ip")] or ["198.51.100.1"]
     wl_ips = [r[0] for r in cur.execute("SELECT ip FROM whitelist ORDER BY ip")] or ["192.0.2.1"]
 
+    # Construct the complete nftables ruleset cleanly (no fragile sed edits)
     lines = [
         "#!/usr/sbin/nft -f",
         "flush ruleset",
@@ -81,6 +103,7 @@ def reload_nftables():
     if udp_ports:
         lines.append(f"        udp dport {{ {', '.join(udp_ports)} }} accept")
 
+    # Preserve default-drop forward and default-drop outbound policies on every reload
     lines.extend([
         "    }",
         "    chain forward {",
@@ -105,6 +128,7 @@ def reload_nftables():
         "",
     ])
 
+    # Write to a staging temp file first and run syntax validation (`nft -c -f`)
     tmp = f"{NFT_CONF}.tmp"
     with open(tmp, "w") as f:
         f.write("\n".join(lines))
@@ -112,17 +136,19 @@ def reload_nftables():
 
     check = subprocess.run(["nft", "-c", "-f", tmp], capture_output=True, text=True)
     if check.returncode != 0:
-        print(f"[ERROR] Syntax validation failed:\n{check.stderr}")
+        print(f"[ERROR] Syntax validation failed; keeping existing firewall:\n{check.stderr}")
         os.remove(tmp)
         return
 
+    # Atomically replace the active config file
     os.replace(tmp, NFT_CONF)
 
-    # Keep /etc/nftables.conf mirrored on RHEL/Rocky so both paths stay in sync
+    # Keep /etc/nftables.conf mirrored on Rocky/RHEL so both paths stay identical
     if NFT_CONF != "/etc/nftables.conf":
         shutil.copy(NFT_CONF, "/etc/nftables.conf")
         os.chmod("/etc/nftables.conf", 0o600)
 
+    # Restore SELinux labels if restorecon is installed (Rocky/RHEL)
     if shutil.which("restorecon"):
         subprocess.run(
             ["restorecon", "-v", NFT_CONF, "/etc/nftables.conf"],
@@ -130,11 +156,16 @@ def reload_nftables():
             check=False,
         )
 
+    # Apply the validated ruleset to the running kernel
     subprocess.run(["nft", "-f", NFT_CONF], check=True)
-    print("[+] Firewall reloaded.")
+    print("[+] Firewall reloaded and persisted.")
 
 
+# ------------------------------------------------------------------------------
+# INTERACTIVE MENU ACTIONS
+# ------------------------------------------------------------------------------
 def ban_ip():
+    """Add an attacker IP or CIDR subnet to @blacklist and drop immediately."""
     ip = input("Malicious IP or CIDR to ban (e.g. 10.10.10.5 or 10.10.10.0/24): ").strip()
     if not is_valid_net(ip):
         print("Invalid IP/CIDR.")
@@ -147,6 +178,7 @@ def ban_ip():
 
 
 def allow_ip():
+    """Add a trusted Blue Team IP or CIDR subnet to @whitelist."""
     ip = input("Trusted IP or CIDR to whitelist: ").strip()
     if not is_valid_net(ip):
         print("Invalid IP/CIDR.")
@@ -159,6 +191,7 @@ def allow_ip():
 
 
 def open_port():
+    """Open an inbound TCP or UDP port (e.g., for a competition inject service)."""
     try:
         port = int(input("Port (1-65535): ").strip())
         assert 1 <= port <= 65535
@@ -177,6 +210,7 @@ def open_port():
 
 
 def close_port():
+    """Remove an inbound port from accepted_ports and reload firewall."""
     try:
         port = int(input("Port to close: ").strip())
     except ValueError:
@@ -190,6 +224,7 @@ def close_port():
 
 
 def block_user():
+    """Flag a local username so warden_daemon.py locks it and strips its shell."""
     user = input("Username to lock: ").strip()
     if not user or user in ("root", "sysadmin"):
         print("Protected account.")
@@ -201,6 +236,7 @@ def block_user():
 
 
 def block_service():
+    """Flag a systemd service unit so warden_daemon.py stops and quarantines it."""
     svc = input("Service unit to quarantine (e.g. evil.service): ").strip()
     if not svc:
         return
@@ -211,6 +247,7 @@ def block_service():
 
 
 def show_status():
+    """Display all currently active firewall rules and daemon enforcement lists."""
     print("\n--- WARDEN ACTIVE POLICY ---")
     print("Accepted Ports :", cur.execute("SELECT port, protocol FROM accepted_ports").fetchall())
     print("Blacklist IPs  :", [r[0] for r in cur.execute("SELECT ip FROM blacklist")])
