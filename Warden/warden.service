@@ -1,5 +1,15 @@
+# ==============================================================================
+# WARDEN.SERVICE — Systemd Unit for the Background Intrusion Monitor
+# ==============================================================================
+# Installed to /etc/systemd/system/warden.service by setup.py.
+# Manage with:
+#   sudo systemctl status warden.service
+#   sudo systemctl restart warden.service
+# ==============================================================================
+
 [Unit]
 Description=Warden CCDC Host Defense & Intrusion Monitor
+# Wait until basic networking is initialized before starting socket sweeps
 After=network.target
 
 [Service]
@@ -7,9 +17,15 @@ Type=simple
 User=root
 Group=root
 WorkingDirectory=/opt/warden
+
+# Execute the daemon from /usr/bin so Rocky/RHEL SELinux allows execution
 ExecStart=/usr/bin/python3 /usr/bin/warden_daemon.py
+
+# Self-healing persistence: automatically restart within 3 seconds if killed
 Restart=always
 RestartSec=3
+
+# Route any uncaught stdout/stderr directly into the Splunk-monitored log file
 StandardOutput=append:/opt/warden/warden.log
 StandardError=append:/opt/warden/warden.log
 
