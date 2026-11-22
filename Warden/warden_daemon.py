@@ -3,6 +3,24 @@
 ================================================================================
 WARDEN DAEMON — Continuous Host Persistence & Intrusion Monitor
 ================================================================================
+PURPOSE:
+    Runs continuously in the background as a systemd service (`warden.service`),
+    sweeping the host every 15 seconds for Red Team persistence and active C2.
+
+FIVE DEFENSIVE SWEEPS PER CYCLE:
+    1. User Audit:       Locks any newly created UID 0, GID 0, or login user not
+                         present in the initial baseline or allowed_users table.
+    2. SSH Login Audit:  Logs all new SSH logins for Incident Reports and kills
+                         any active TTY session originating from @blacklist.
+    3. Socket C2 Sweep:  Inspects live ESTABLISHED TCP sockets via `ss -tnap`
+                         and kills any shell or scripting interpreter holding an
+                         unauthorized external socket (catches reverse shells
+                         regardless of full path or obfuscated arguments).
+    4. Crontab Guard:    Detects unauthorized modifications to /etc/crontab, logs
+                         the injected payload for IR, and restores the baseline.
+    5. Unit Quarantine:  Stops, disables, and moves any flagged systemd service
+                         file into /opt/warden/quarantine/.
+================================================================================
 """
 
 import os
@@ -26,25 +44,30 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - [DAEMON] %(message)s",
 )
 
+# Binaries that should never hold direct external TCP connections on a server
 SUSPICIOUS_SHELL_BINARIES = {
     "bash", "sh", "dash", "zsh", "ash", "ksh",
     "nc", "ncat", "netcat", "socat",
     "python", "python3", "perl", "ruby", "php",
 }
 
-# Add your Splunk Indexer IP here so Splunk scripts aren't flagged
+# Loopback and trusted internal IPs excluded from outbound socket kills
+# (Add your Splunk Indexer IP here if Splunk runs custom alert scripts)
 TRUSTED_OUTBOUND_IPS = {"127.0.0.1", "::1"}
 
+# In-memory baselines captured when the daemon starts
 baseline_users = set()
 baseline_crontab = ""
 seen_logins = set()
 
 
 def run_cmd(cmd):
+    """Execute a system command safely and return stripped stdout."""
     return subprocess.run(cmd, capture_output=True, text=True, check=False).stdout.strip()
 
 
 def get_passwd():
+    """Parse /etc/passwd into {username: (uid, gid, login_shell)}."""
     users = {}
     with open("/etc/passwd") as f:
         for line in f:
@@ -55,6 +78,7 @@ def get_passwd():
 
 
 def init_baselines():
+    """Snapshot known-good /etc/passwd accounts and /etc/crontab contents at boot."""
     global baseline_users, baseline_crontab
     baseline_users = set(get_passwd().keys())
     cron = Path("/etc/crontab")
@@ -64,10 +88,13 @@ def init_baselines():
 
 
 def sweep():
+    """Execute one full 5-part defensive audit cycle."""
     global seen_logins
+
+    # Reload dynamic policies from SQLite on every sweep so `gatekeeper` CLI
+    # changes take effect within 15 seconds without restarting the daemon.
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-
     allowed_users = {r[0] for r in cur.execute("SELECT name FROM allowed_users")}
     blocked_users = {r[0] for r in cur.execute("SELECT name FROM blocked_users")}
     blocked_services = {r[0] for r in cur.execute("SELECT name FROM blocked_services")}
@@ -75,15 +102,20 @@ def sweep():
     blacklist_ips = {r[0] for r in cur.execute("SELECT ip FROM blacklist")}
     conn.close()
 
-    # 1. User Audit (protects baseline & nobody/65534; locks new/rogue accounts)
+    # --------------------------------------------------------------------------
+    # 1. LOCAL USER ACCOUNT AUDIT
+    # --------------------------------------------------------------------------
     for user, (uid, gid, shell) in get_passwd().items():
         if user == "root" or user in allowed_users or user in baseline_users:
             continue
+        # Flag backdoor UID 0/GID 0 accounts, newly added human UIDs (>=1000), or CLI-blocked users
         if user in blocked_users or uid == 0 or gid == 0 or (1000 <= uid < 65534):
-            logging.error(f"ROGUE USER: {user} (UID={uid}, GID={gid}, Shell={shell})")
+            logging.error(f"ROGUE USER DETECTED: {user} (UID={uid}, GID={gid}, Shell={shell})")
             run_cmd(["usermod", "-L", "-s", "/usr/sbin/nologin", user])
 
-    # 2. SSH / Login Session Audit (kills blacklisted IPs; logs unlisted IPs for IR)
+    # --------------------------------------------------------------------------
+    # 2. ACTIVE SSH / TTY LOGIN AUDIT
+    # --------------------------------------------------------------------------
     for line in run_cmd(["who"]).splitlines():
         parts = line.split()
         if len(parts) >= 5:
@@ -93,13 +125,19 @@ def sweep():
             if key in seen_logins:
                 continue
             seen_logins.add(key)
+
+            # Immediately kill TTY sessions from banned IPs
             if ip in blacklist_ips:
                 run_cmd(["pkill", "-KILL", "-t", tty])
-                logging.error(f"TERMINATED blacklisted SSH session: {user} from {ip} ({tty})")
+                logging.error(f"TERMINATED blacklisted SSH session: user={user} ip={ip} tty={tty}")
             elif ip not in whitelist_ips:
                 logging.warning(f"SSH login observed: user={user} ip={ip} tty={tty}")
 
-    # 3. Outbound Socket Reverse Shell & C2 Sweep
+    # --------------------------------------------------------------------------
+    # 3. OUTBOUND SOCKET REVERSE SHELL & C2 SWEEP
+    # --------------------------------------------------------------------------
+    # Inspect active ESTABLISHED TCP sockets rather than regex-matching `ps` so
+    # shells invoked via PATH (`bash -i`), Python, Perl, or nc are caught reliably.
     my_pid = os.getpid()
     ss_out = run_cmd(["ss", "-tnap", "state", "established"])
     for line in ss_out.splitlines()[1:]:
@@ -110,12 +148,14 @@ def sweep():
         local_addr, peer_addr = parts[2], parts[3]
         proc_info = " ".join(parts[4:])
 
+        # Extract remote peer IP and local port (handles IPv4 and [IPv6]:port)
         peer_ip = peer_addr.rsplit(":", 1)[0].strip("[]")
         local_port = local_addr.rsplit(":", 1)[-1]
 
         if peer_ip in TRUSTED_OUTBOUND_IPS or peer_ip in whitelist_ips:
             continue
 
+        # Parse process binary name and PID from ss output: users:(("bash",pid=1234,fd=0))
         match = re.search(r'\(\("([^"]+)",pid=(\d+),', proc_info)
         if not match:
             continue
@@ -123,10 +163,16 @@ def sweep():
         comm, pid_str = match.group(1), match.group(2)
         pid = int(pid_str)
 
-        # Kill any shell/interpreter holding an active external socket (excluding inbound SSH on port 22)
+        # Terminate any shell/interpreter holding an external socket (excluding inbound SSH on 22)
         if pid != my_pid and comm in SUSPICIOUS_SHELL_BINARIES and local_port != "22":
             try:
-                cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\x00", b" ").decode(errors="ignore").strip()
+                cmdline = (
+                    Path(f"/proc/{pid}/cmdline")
+                    .read_bytes()
+                    .replace(b"\x00", b" ")
+                    .decode(errors="ignore")
+                    .strip()
+                )
             except Exception:
                 cmdline = comm
 
@@ -139,7 +185,9 @@ def sweep():
             except (ProcessLookupError, PermissionError) as err:
                 logging.error(f"Failed to kill PID={pid} ({comm}) -> {peer_addr}: {err}")
 
-    # 4. Crontab Integrity
+    # --------------------------------------------------------------------------
+    # 4. /ETC/CRONTAB INTEGRITY GUARD
+    # --------------------------------------------------------------------------
     cron = Path("/etc/crontab")
     if cron.is_file():
         current = cron.read_text()
@@ -147,7 +195,9 @@ def sweep():
             logging.error(f"CRONTAB TAMPERED! Captured contents:\n{current.strip()}")
             cron.write_text(baseline_crontab)
 
-    # 5. Blacklisted Systemd Units
+    # --------------------------------------------------------------------------
+    # 5. QUARANTINE BLACKLISTED SYSTEMD UNITS
+    # --------------------------------------------------------------------------
     if blocked_services:
         for line in run_cmd(["systemctl", "list-units", "--type=service", "--state=running", "--no-legend"]).splitlines():
             unit = line.split()[0] if line.split() else ""
@@ -159,7 +209,7 @@ def sweep():
                     QUARANTINE_DIR.mkdir(parents=True, exist_ok=True)
                     shutil.move(str(unit_path), str(QUARANTINE_DIR / unit))
                 run_cmd(["systemctl", "daemon-reload"])
-                logging.error(f"QUARANTINED service: {unit}")
+                logging.error(f"QUARANTINED malicious service unit: {unit}")
 
 
 if __name__ == "__main__":
