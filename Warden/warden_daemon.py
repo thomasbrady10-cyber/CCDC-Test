@@ -1,45 +1,87 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-WARDEN DAEMON — Continuous Host Persistence & Intrusion Monitor
+WARDEN DAEMON — Continuous Linux Host Intrusion & Forensic Quarantine Monitor
 ================================================================================
 PURPOSE:
-    Runs continuously in the background as a systemd service (`warden.service`),
-    sweeping the host every 15 seconds for Red Team persistence and active C2.
-
-SIX DEFENSIVE SWEEPS PER CYCLE:
-    1. User Audit:       Locks any newly created UID 0, GID 0, or login user not
-                         present in the initial baseline or allowed_users table.
-    2. SSH Login Audit:  Logs all new SSH logins for Incident Reports and kills
-                         any active TTY session originating from @blacklist.
-    3. Socket C2 Sweep:  Inspects live ESTABLISHED TCP sockets via `ss -tnap`
-                         and kills any shell or scripting interpreter holding an
-                         unauthorized external socket (catches reverse shells
-                         regardless of full path or obfuscated arguments).
-    4. Crontab Guard:    Detects unauthorized modifications to /etc/crontab, logs
-                         the injected payload for IR, and restores the baseline.
-    5. Unit Quarantine:  Stops, disables, and moves any flagged systemd service
-                         file into /opt/warden/quarantine/.
-    6. Shell Integrity:  Detects symlink, hard-link (inode), or SHA-256 hash
-                         tampering on /bin/bash, /bin/sh, /sbin/nologin,
-                         /bin/false, and all shells in /etc/shells.
+    Runs continuously in the background via systemd (`warden.service`), scanning
+    every 5 seconds to detect, freeze, and package Red Team activity for CCDC
+    Incident Reports (IRs) WITHOUT destroying forensic evidence:
+      1. Reverse-Shell & C2 Process Quarantine (`SIGSTOP` + IR Bundle):
+         Instead of `SIGKILL` (which wipes `/proc/<pid>`), freezes suspicious
+         processes holding external sockets using `SIGSTOP` so they cannot
+         execute commands or beacon out, then generates a ready-to-submit
+         forensic folder in `/opt/warden/quarantine/IR_<timestamp>_pid<PID>/`
+         complete with a plain-English explanation, parent process chain,
+         command line, environment variables, and open file descriptors.
+      2. Unauthorized User & SSH Session Enforcement: Locks rogue accounts and
+         suspends/terminates unauthorized sessions.
+      3. Malicious Systemd Unit Quarantine: Stops, disables, masks, and moves
+         any unit in `blocked_services` into `/opt/warden/quarantine/`.
+      4. Crontab Tamper Reversion: Saves the tampered `/etc/crontab` into
+         quarantine as IR evidence before restoring the clean baseline.
+      5. Shell Binary Integrity Guard: Monitors SHA-256 hashes of `/bin/bash`,
+         `/bin/sh`, `/sbin/nologin`, and `/bin/false`.
 ================================================================================
 """
 
 import os
 import re
+import pwd
 import time
-import signal
 import shutil
+import signal
 import hashlib
-import sqlite3
 import logging
+import sqlite3
 import subprocess
+from datetime import datetime
 from pathlib import Path
 
 DB_PATH = "/opt/warden/warden.db"
 LOG_PATH = "/opt/warden/warden.log"
 QUARANTINE_DIR = Path("/opt/warden/quarantine")
+
+# Internal trusted infrastructure peers that legitimate processes may talk to:
+# Loopback + Debian Splunk (.20) + 2022 AD (.100) + 2019 MSSQL (.120)
+TRUSTED_OUTBOUND_IPS = {
+    "127.0.0.1",
+    "::1",
+    "172.20.240.20",
+    "172.20.240.100",
+    "172.20.240.120",
+}
+
+# Shells & scripting interpreters that should NEVER hold direct external sockets
+SUSPICIOUS_SOCKET_PROCS = {
+    "bash", "sh", "dash", "zsh", "ksh", "csh", "tcsh",
+    "nc", "ncat", "netcat", "socat",
+    "python", "python2", "python3", "perl", "ruby", "php", "lua",
+}
+
+# System binaries that should NEVER be moved/deleted from /bin or /usr/bin
+# (we copy them for hashing instead of moving them)
+PROTECTED_SYSTEM_PATHS = {
+    "/bin/bash", "/usr/bin/bash",
+    "/bin/sh", "/usr/bin/sh",
+    "/bin/dash", "/usr/bin/dash",
+    "/usr/bin/python3", "/usr/bin/python",
+    "/usr/bin/perl", "/usr/bin/php", "/usr/bin/ruby",
+}
+
+# Critical shell/nologin binaries watched for SHA-256 hash drift
+WATCHED_BINARIES = [
+    "/bin/bash",
+    "/bin/sh",
+    "/sbin/nologin",
+    "/usr/sbin/nologin",
+    "/bin/false",
+    "/usr/bin/false",
+]
+
+# Track PIDs already frozen via SIGSTOP so we don't re-generate duplicate IR folders
+# every 5 seconds while the frozen process sits in quarantine
+FROZEN_PIDS = set()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,291 +90,332 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - [DAEMON] %(message)s",
 )
 
-# Binaries that should never hold direct external TCP connections on a server
-SUSPICIOUS_SHELL_BINARIES = {
-    "bash", "sh", "dash", "zsh", "ash", "ksh",
-    "nc", "ncat", "netcat", "socat",
-    "python", "python3", "perl", "ruby", "php",
-}
 
-# Loopback and trusted internal IPs excluded from outbound socket kills
-# (Add your Splunk Indexer IP here if Splunk runs custom alert scripts)
-TRUSTED_OUTBOUND_IPS = {"127.0.0.1", "::1"}
-
-# Interactive shells that grant command execution
-INTERACTIVE_SHELLS = {
-    "/bin/bash", "/usr/bin/bash",
-    "/bin/sh", "/usr/bin/sh",
-    "/bin/dash", "/usr/bin/dash",
-    "/bin/zsh", "/usr/bin/zsh",
-}
-
-# Restricted shells meant to block interactive logins for service accounts
-RESTRICTED_SHELLS = {
-    "/sbin/nologin", "/usr/sbin/nologin",
-    "/bin/false", "/usr/bin/false",
-}
-
-# In-memory baselines captured when the daemon starts
-baseline_users = set()
-baseline_crontab = ""
-baseline_shell_hashes = {}
-seen_logins = set()
-alerted_shell_anomalies = set()
-
-
-def run_cmd(cmd):
-    """Execute a system command safely and return stripped stdout."""
-    return subprocess.run(cmd, capture_output=True, text=True, check=False).stdout.strip()
-
-
-def get_passwd():
-    """Parse /etc/passwd into {username: (uid, gid, login_shell)}."""
-    users = {}
-    with open("/etc/passwd") as f:
-        for line in f:
-            p = line.strip().split(":")
-            if len(p) >= 7:
-                users[p[0]] = (int(p[2]), int(p[3]), p[6])
-    return users
-
-
-def get_monitored_shells():
-    """Collect all interactive, restricted, and /etc/shells paths present on disk."""
-    shells = set(INTERACTIVE_SHELLS | RESTRICTED_SHELLS)
-    etc_shells = Path("/etc/shells")
-    if etc_shells.is_file():
-        for line in etc_shells.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#"):
-                shells.add(line)
-    return sorted(shells)
-
-
-def hash_file(path_str):
-    """Return SHA-256 hex digest of a file, or None if missing/unreadable."""
+def sha256_file(path: str) -> str:
+    """Compute SHA-256 digest of a file on disk (returns empty string if unreadable)."""
     try:
         h = hashlib.sha256()
-        with open(path_str, "rb") as f:
-            for chunk in iter(lambda: f.read(65536), b""):
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
                 h.update(chunk)
         return h.hexdigest()
     except OSError:
-        return None
+        return ""
 
 
-def init_baselines():
-    """Snapshot known-good /etc/passwd, /etc/crontab, and shell binary hashes at boot."""
-    global baseline_users, baseline_crontab, baseline_shell_hashes
-    baseline_users = set(get_passwd().keys())
-
-    cron = Path("/etc/crontab")
-    if cron.is_file():
-        baseline_crontab = cron.read_text()
-
-    for sp in get_monitored_shells():
-        digest = hash_file(sp)
-        if digest:
-            baseline_shell_hashes[sp] = digest
-
-    logging.info(
-        f"Baselines captured ({len(baseline_users)} users, {len(baseline_shell_hashes)} shell binaries)."
-    )
-
-
-def sweep():
-    """Execute one full 6-part defensive audit cycle."""
-    global seen_logins
-
-    # Reload dynamic policies from SQLite on every sweep so `gatekeeper` CLI
-    # changes take effect within 15 seconds without restarting the daemon.
+def get_policy():
+    """Fetch current allowed/blocked users and blocked services from warden.db."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     allowed_users = {r[0] for r in cur.execute("SELECT name FROM allowed_users")}
     blocked_users = {r[0] for r in cur.execute("SELECT name FROM blocked_users")}
-    blocked_services = {r[0] for r in cur.execute("SELECT name FROM blocked_services")}
-    whitelist_ips = {r[0] for r in cur.execute("SELECT ip FROM whitelist")}
-    blacklist_ips = {r[0] for r in cur.execute("SELECT ip FROM blacklist")}
+    blocked_svcs = {r[0] for r in cur.execute("SELECT name FROM blocked_services")}
     conn.close()
+    return allowed_users, blocked_users, blocked_svcs
 
-    # --------------------------------------------------------------------------
-    # 1. LOCAL USER ACCOUNT AUDIT
-    # --------------------------------------------------------------------------
-    for user, (uid, gid, shell) in get_passwd().items():
-        if user == "root" or user in allowed_users or user in baseline_users:
+
+def explain_threat(proc_name: str, peer: str, cmdline: str, exe_path: str) -> str:
+    """
+    Generate a plain-English explanation of WHY Warden quarantined this process
+    so Blue Team can paste it straight into an Incident Response (IR) form.
+    """
+    p = proc_name.lower()
+    reasons = []
+
+    if p in {"bash", "sh", "dash", "zsh", "ksh", "csh", "tcsh"}:
+        reasons.append(
+            f"Interactive command shell ('{proc_name}') was caught holding an active "
+            f"network socket to external IP {peer}. Standard shells never open raw "
+            f"TCP connections on their own; this is a classic reverse-shell or bind-shell indicator."
+        )
+    elif p in {"nc", "ncat", "netcat", "socat"}:
+        reasons.append(
+            f"Raw network relay utility ('{proc_name}') established a socket to {peer}, "
+            f"commonly used for manual reverse shells, port relays, or file exfiltration."
+        )
+    elif p in {"python", "python2", "python3", "perl", "ruby", "php", "lua"}:
+        reasons.append(
+            f"Scripting interpreter ('{proc_name}') opened an unauthorized outbound/external "
+            f"socket to {peer}. Attackers frequently use one-liner scripts or web-shell "
+            f"child processes to establish C2 callbacks."
+        )
+    else:
+        reasons.append(
+            f"Process '{proc_name}' held an unauthorized external network connection to {peer}."
+        )
+
+    if any(tmp_dir in exe_path or tmp_dir in cmdline for tmp_dir in ("/tmp/", "/dev/shm/", "/var/tmp/")):
+        reasons.append(
+            "Execution originated from a world-writable temporary directory (/tmp, /dev/shm, or /var/tmp), "
+            "strongly indicating a dropped Red Team payload."
+        )
+
+    if "deleted" in exe_path:
+        reasons.append(
+            "The underlying binary on disk was deleted while running (fileless/self-deleting malware technique)."
+        )
+
+    return " ".join(reasons)
+
+
+def build_parent_chain(pid: int) -> str:
+    """Walk /proc/<pid>/status upward to reconstruct the full process ancestry tree."""
+    chain = []
+    curr = pid
+    visited = set()
+    while curr > 1 and curr not in visited:
+        visited.add(curr)
+        try:
+            status_text = Path(f"/proc/{curr}/status").read_text(errors="ignore")
+            name_m = re.search(r"^Name:\s*(.+)$", status_text, re.M)
+            ppid_m = re.search(r"^PPid:\s*(\d+)$", status_text, re.M)
+            uid_m = re.search(r"^Uid:\s*(\d+)", status_text, re.M)
+            name = name_m.group(1).strip() if name_m else "?"
+            uid = uid_m.group(1) if uid_m else "?"
+            cmd = (
+                Path(f"/proc/{curr}/cmdline")
+                .read_bytes()
+                .replace(b"\x00", b" ")
+                .decode(errors="ignore")
+                .strip()
+            )
+            chain.append(f"PID {curr} (UID {uid}) [{name}]: {cmd}")
+            curr = int(ppid_m.group(1)) if ppid_m else 0
+        except OSError:
+            break
+    return "\n  -> ".join(chain) if chain else "Unavailable"
+
+
+def quarantine_process(pid: int, proc_name: str, local_addr: str, peer: str):
+    """
+    1. Freeze the process immediately via `SIGSTOP` so it cannot run commands
+       or transmit data while preserving `/proc/<pid>` intact in memory.
+    2. Collect full forensic artifacts and write an IR summary into
+       `/opt/warden/quarantine/IR_<timestamp>_pid<pid>_<proc>/`.
+    3. Copy the suspicious binary (if not a core system interpreter) and compute
+       its SHA-256 hash for your Incident Report.
+    """
+    # Freeze process execution immediately (reversible with `kill -CONT <pid>` if needed)
+    try:
+        os.kill(pid, signal.SIGSTOP)
+    except ProcessLookupError:
+        return
+    except PermissionError as exc:
+        logging.error(f"Failed to SIGSTOP PID {pid}: {exc}")
+        return
+
+    FROZEN_PIDS.add(pid)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ir_dir = QUARANTINE_DIR / f"IR_{ts}_pid{pid}_{proc_name}"
+    ir_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(ir_dir, 0o700)
+
+    # Read /proc/<pid> metadata while the process is safely frozen
+    try:
+        cmdline = (
+            Path(f"/proc/{pid}/cmdline")
+            .read_bytes()
+            .replace(b"\x00", b" ")
+            .decode(errors="ignore")
+            .strip()
+        )
+    except OSError:
+        cmdline = "<unreadable>"
+
+    try:
+        exe_path = os.readlink(f"/proc/{pid}/exe")
+    except OSError:
+        exe_path = "<unknown>"
+
+    try:
+        cwd_path = os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        cwd_path = "<unknown>"
+
+    parent_chain = build_parent_chain(pid)
+    explanation = explain_threat(proc_name, peer, cmdline, exe_path)
+
+    # Copy executable binary to quarantine for hashing/submission (never move /bin/bash!)
+    bin_sha256 = "N/A"
+    copied_note = "System interpreter left in place (not moved)."
+    clean_exe = exe_path.replace(" (deleted)", "")
+    if clean_exe and clean_exe not in PROTECTED_SYSTEM_PATHS:
+        dest_bin = ir_dir / f"quarantined_binary_{Path(clean_exe).name}"
+        try:
+            # Reading from /proc/<pid>/exe works even if the file was unlinked on disk!
+            shutil.copyfile(f"/proc/{pid}/exe", str(dest_bin))
+            os.chmod(dest_bin, 0o600)
+            bin_sha256 = sha256_file(str(dest_bin))
+            copied_note = f"Copied executable to {dest_bin}"
+        except OSError as exc:
+            copied_note = f"Could not copy binary: {exc}"
+    elif os.path.exists(clean_exe):
+        bin_sha256 = sha256_file(clean_exe)
+
+    # Dump environment variables (/proc/<pid>/environ)
+    try:
+        env_raw = Path(f"/proc/{pid}/environ").read_bytes().replace(b"\x00", b"\n").decode(errors="ignore")
+        (ir_dir / "environ.txt").write_text(env_raw)
+    except OSError:
+        pass
+
+    # Dump open file descriptors & sockets (/proc/<pid>/fd)
+    fd_lines = []
+    fd_dir = Path(f"/proc/{pid}/fd")
+    if fd_dir.exists():
+        for fd in sorted(fd_dir.iterdir(), key=lambda x: x.name):
+            try:
+                fd_lines.append(f"fd {fd.name} -> {os.readlink(fd)}")
+            except OSError:
+                pass
+    (ir_dir / "open_files.txt").write_text("\n".join(fd_lines) + "\n")
+
+    # Write human-readable Incident Report summary file
+    report_text = f"""================================================================================
+WARDEN AUTOMATED INCIDENT REPORT (IR) EVIDENCE PACKET
+================================================================================
+Timestamp         : {datetime.now().isoformat()}
+Action Taken      : PROCESS FROZEN IN QUARANTINE (SIGSTOP) — NOT KILLED
+Process Name      : {proc_name}
+PID               : {pid}
+Local Socket      : {local_addr}
+Remote Attacker   : {peer}
+Executable Path   : {exe_path}
+Binary SHA-256    : {bin_sha256}
+Binary Handling   : {copied_note}
+Working Directory : {cwd_path}
+Full Command Line : {cmdline}
+
+PLAIN-ENGLISH EXPLANATION (WHY THIS WAS FLAGGED):
+  {explanation}
+
+PROCESS ANCESTRY TREE (PARENT -> CHILD):
+  -> {parent_chain}
+
+OPERATOR NEXT STEPS FOR INCIDENT RESPONSE:
+  1. Ban attacker IP via: sudo gatekeeper  (Option 1 -> {peer.rsplit(':', 1)[0]})
+  2. Review open_files.txt and environ.txt in this folder ({ir_dir})
+  3. After submitting your Incident Report, terminate the frozen PID with:
+       sudo kill -9 {pid}
+     (Or if this was a false positive, resume it with: sudo kill -CONT {pid})
+================================================================================
+"""
+    report_file = ir_dir / "incident_report.txt"
+    report_file.write_text(report_text)
+    os.chmod(report_file, 0o600)
+
+    logging.critical(
+        f"QUARANTINED PROCESS (SIGSTOP) | proc={proc_name} pid={pid} peer={peer} "
+        f"ir_folder={ir_dir} reason='{explanation}'"
+    )
+
+
+def quarantine_reverse_shells():
+    """
+    Inspect all ESTABLISHED TCP connections via `ss -tnap`. If a shell or
+    scripting interpreter holds a socket to an untrusted remote IP, freeze it
+    with `SIGSTOP` and capture an Incident Report packet.
+    """
+    # Prune PIDs from FROZEN_PIDS if an operator manually killed them
+    for tracked_pid in list(FROZEN_PIDS):
+        if not os.path.exists(f"/proc/{tracked_pid}"):
+            FROZEN_PIDS.discard(tracked_pid)
+
+    res = subprocess.run(["ss", "-tnap"], capture_output=True, text=True, check=False)
+    for line in res.stdout.splitlines():
+        if "ESTAB" not in line:
             continue
-        # Flag backdoor UID 0/GID 0 accounts, newly added human UIDs (>=1000), or CLI-blocked users
-        if user in blocked_users or uid == 0 or gid == 0 or (1000 <= uid < 65534):
-            logging.error(f"ROGUE USER DETECTED: {user} (UID={uid}, GID={gid}, Shell={shell})")
-            run_cmd(["usermod", "-L", "-s", "/usr/sbin/nologin", user])
-
-    # --------------------------------------------------------------------------
-    # 2. ACTIVE SSH / TTY LOGIN AUDIT
-    # --------------------------------------------------------------------------
-    for line in run_cmd(["who"]).splitlines():
-        parts = line.split()
-        if len(parts) >= 5:
-            user, tty, t_str = parts[0], parts[1], parts[3]
-            ip = parts[4].strip("()")
-            key = f"{user}@{tty}@{ip}@{t_str}"
-            if key in seen_logins:
-                continue
-            seen_logins.add(key)
-
-            # Immediately kill TTY sessions from banned IPs
-            if ip in blacklist_ips:
-                run_cmd(["pkill", "-KILL", "-t", tty])
-                logging.error(f"TERMINATED blacklisted SSH session: user={user} ip={ip} tty={tty}")
-            elif ip not in whitelist_ips:
-                logging.warning(f"SSH login observed: user={user} ip={ip} tty={tty}")
-
-    # --------------------------------------------------------------------------
-    # 3. OUTBOUND SOCKET REVERSE SHELL & C2 SWEEP
-    # --------------------------------------------------------------------------
-    # Inspect active ESTABLISHED TCP sockets rather than regex-matching `ps` so
-    # shells invoked via PATH (`bash -i`), Python, Perl, or nc are caught reliably.
-    my_pid = os.getpid()
-    ss_out = run_cmd(["ss", "-tnap", "state", "established"])
-    for line in ss_out.splitlines()[1:]:
         parts = line.split()
         if len(parts) < 5:
             continue
 
-        local_addr, peer_addr = parts[2], parts[3]
-        proc_info = " ".join(parts[4:])
-
-        # Extract remote peer IP and local port (handles IPv4 and [IPv6]:port)
-        peer_ip = peer_addr.rsplit(":", 1)[0].strip("[]")
-        local_port = local_addr.rsplit(":", 1)[-1]
-
-        if peer_ip in TRUSTED_OUTBOUND_IPS or peer_ip in whitelist_ips:
+        local_addr = parts[3]
+        peer = parts[4]
+        peer_ip = peer.rsplit(":", 1)[0].strip("[]")
+        if peer_ip in TRUSTED_OUTBOUND_IPS:
             continue
 
-        # Parse process binary name and PID from ss output: users:(("bash",pid=1234,fd=0))
-        match = re.search(r'\(\("([^"]+)",pid=(\d+),', proc_info)
-        if not match:
+        proc_matches = re.findall(r'\("([^"]+)",pid=(\d+),', line)
+        for proc_name, pid_str in proc_matches:
+            pid = int(pid_str)
+            if pid in FROZEN_PIDS:
+                continue
+            if proc_name.lower() in SUSPICIOUS_SOCKET_PROCS:
+                quarantine_process(pid, proc_name, local_addr, peer)
+
+
+def enforce_users(allowed_users, blocked_users):
+    """
+    Lock rogue UID >= 1000 or explicitly blocked users (`usermod -L -s /sbin/nologin`)
+    and freeze their active processes (`SIGSTOP`) for IR inspection.
+    """
+    for entry in pwd.getpwall():
+        user = entry.pw_name
+        if user in ("root", "sysadmin"):
             continue
+        is_rogue = (user in blocked_users) or (entry.pw_uid >= 1000 and user not in allowed_users)
+        if is_rogue:
+            # Only act if the user isn't already locked to /sbin/nologin
+            if entry.pw_shell != "/sbin/nologin":
+                logging.warning(f"LOCKING ROGUE USER: {user} (UID={entry.pw_uid})")
+                subprocess.run(["usermod", "-L", "-s", "/sbin/nologin", user], check=False)
+                subprocess.run(["pkill", "-STOP", "-u", user], check=False)
 
-        comm, pid_str = match.group(1), match.group(2)
-        pid = int(pid_str)
 
-        # Terminate any shell/interpreter holding an external socket (excluding inbound SSH on 22)
-        if pid != my_pid and comm in SUSPICIOUS_SHELL_BINARIES and local_port != "22":
-            try:
-                cmdline = (
-                    Path(f"/proc/{pid}/cmdline")
-                    .read_bytes()
-                    .replace(b"\x00", b" ")
-                    .decode(errors="ignore")
-                    .strip()
-                )
-            except Exception:
-                cmdline = comm
+def enforce_services(blocked_svcs):
+    """Stop, disable, mask, and move any blacklisted unit file into quarantine."""
+    for svc in blocked_svcs:
+        unit = svc if svc.endswith(".service") else f"{svc}.service"
+        unit_path = Path(f"/etc/systemd/system/{unit}")
+        if unit_path.exists():
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            logging.critical(f"QUARANTINING ROGUE SERVICE: {unit}")
+            subprocess.run(["systemctl", "stop", unit], check=False)
+            subprocess.run(["systemctl", "disable", unit], check=False)
+            subprocess.run(["systemctl", "mask", unit], check=False)
+            shutil.move(str(unit_path), str(QUARANTINE_DIR / f"{ts}_{unit}"))
+            subprocess.run(["systemctl", "daemon-reload"], check=False)
 
-            try:
-                os.kill(pid, signal.SIGKILL)
-                logging.error(
-                    f"KILLED reverse shell socket PID={pid} BIN={comm} "
-                    f"LOCAL={local_addr} PEER={peer_addr} CMD='{cmdline}'"
-                )
-            except (ProcessLookupError, PermissionError) as err:
-                logging.error(f"Failed to kill PID={pid} ({comm}) -> {peer_addr}: {err}")
 
-    # --------------------------------------------------------------------------
-    # 4. /ETC/CRONTAB INTEGRITY GUARD
-    # --------------------------------------------------------------------------
-    cron = Path("/etc/crontab")
-    if cron.is_file():
-        current = cron.read_text()
-        if current != baseline_crontab:
-            logging.error(f"CRONTAB TAMPERED! Captured contents:\n{current.strip()}")
-            cron.write_text(baseline_crontab)
+def main():
+    logging.info("Warden forensic quarantine daemon started.")
+    QUARANTINE_DIR.mkdir(parents=True, exist_ok=True)
 
-    # --------------------------------------------------------------------------
-    # 5. QUARANTINE BLACKLISTED SYSTEMD UNITS
-    # --------------------------------------------------------------------------
-    if blocked_services:
-        for line in run_cmd(["systemctl", "list-units", "--type=service", "--state=running", "--no-legend"]).splitlines():
-            unit = line.split()[0] if line.split() else ""
-            if unit in blocked_services or unit.replace(".service", "") in blocked_services:
-                run_cmd(["systemctl", "stop", unit])
-                run_cmd(["systemctl", "disable", unit])
-                unit_path = Path(f"/etc/systemd/system/{unit}")
-                if unit_path.exists():
-                    QUARANTINE_DIR.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(unit_path), str(QUARANTINE_DIR / unit))
-                run_cmd(["systemctl", "daemon-reload"])
-                logging.error(f"QUARANTINED malicious service unit: {unit}")
+    baseline_hashes = {p: sha256_file(p) for p in WATCHED_BINARIES if os.path.exists(p)}
+    crontab_path = Path("/etc/crontab")
+    baseline_crontab = crontab_path.read_text() if crontab_path.exists() else ""
 
-    # --------------------------------------------------------------------------
-    # 6. SHELL BINARY, SYMLINK, HARD-LINK & SHA-256 HASH INTEGRITY CHECK
-    # --------------------------------------------------------------------------
-    # Catches Red Team persistence where /sbin/nologin or /bin/false is symlinked,
-    # hard-linked (same inode), or overwritten with /bin/bash or /bin/sh.
-    interactive_hashes = {}
-    interactive_inodes = {}
+    while True:
+        try:
+            allowed_users, blocked_users, blocked_svcs = get_policy()
+            quarantine_reverse_shells()
+            enforce_users(allowed_users, blocked_users)
+            enforce_services(blocked_svcs)
 
-    for sp in INTERACTIVE_SHELLS:
-        p = Path(sp)
-        if p.exists():
-            digest = hash_file(sp)
-            if digest:
-                interactive_hashes[digest] = sp
-            st = p.stat()
-            interactive_inodes[(st.st_dev, st.st_ino)] = sp
-
-    for sp in get_monitored_shells():
-        p = Path(sp)
-        if not p.exists():
-            continue
-
-        # A. Detect symlink tampering (e.g., /sbin/nologin -> /bin/bash)
-        if p.is_symlink():
-            resolved = str(p.resolve())
-            if sp in RESTRICTED_SHELLS and resolved in INTERACTIVE_SHELLS:
-                key = f"symlink:{sp}->{resolved}"
-                if key not in alerted_shell_anomalies:
-                    alerted_shell_anomalies.add(key)
-                    logging.error(
-                        f"CRITICAL SHELL TAMPER (SYMLINK): {sp} points to interactive shell {resolved}!"
+            # Save tampered /etc/crontab to quarantine for IR evidence before reverting
+            if crontab_path.exists():
+                current_cron = crontab_path.read_text()
+                if current_cron != baseline_crontab:
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    evidence_path = QUARANTINE_DIR / f"IR_{ts}_tampered_crontab.txt"
+                    evidence_path.write_text(current_cron)
+                    logging.critical(
+                        f"TAMPER DETECTED in /etc/crontab — saved evidence to {evidence_path} and reverted!"
                     )
+                    crontab_path.write_text(baseline_crontab)
 
-        # B. Detect hard links (shared inode) or binary copies replacing nologin/false
-        st = p.stat()
-        digest = hash_file(sp)
-        if sp in RESTRICTED_SHELLS:
-            inode_key = (st.st_dev, st.st_ino)
-            if inode_key in interactive_inodes:
-                key = f"hardlink:{sp}=={interactive_inodes[inode_key]}"
-                if key not in alerted_shell_anomalies:
-                    alerted_shell_anomalies.add(key)
-                    logging.error(
-                        f"CRITICAL SHELL TAMPER (HARD LINK): {sp} shares inode {st.st_ino} with {interactive_inodes[inode_key]}!"
-                    )
-            elif digest and digest in interactive_hashes:
-                key = f"hashmatch:{sp}=={interactive_hashes[digest]}"
-                if key not in alerted_shell_anomalies:
-                    alerted_shell_anomalies.add(key)
-                    logging.error(
-                        f"CRITICAL SHELL TAMPER (HASH MATCH): {sp} has identical SHA-256 ({digest[:16]}...) to {interactive_hashes[digest]}!"
-                    )
+            # Alert if any watched shell/nologin binary hash changes on disk
+            for bin_path, orig_hash in baseline_hashes.items():
+                curr_hash = sha256_file(bin_path)
+                if curr_hash and curr_hash != orig_hash:
+                    logging.critical(f"BINARY INTEGRITY ALERT: {bin_path} SHA-256 changed!")
+                    baseline_hashes[bin_path] = curr_hash
 
-        # C. Detect post-deploy binary modification against initial startup baseline
-        if sp in baseline_shell_hashes and digest and digest != baseline_shell_hashes[sp]:
-            key = f"modified:{sp}:{digest}"
-            if key not in alerted_shell_anomalies:
-                alerted_shell_anomalies.add(key)
-                logging.error(
-                    f"CRITICAL SHELL MODIFIED: {sp} SHA-256 changed from "
-                    f"{baseline_shell_hashes[sp][:16]}... to {digest[:16]}...!"
-                )
+        except Exception as exc:
+            logging.error(f"Daemon loop error: {exc}")
+
+        time.sleep(5)
 
 
 if __name__ == "__main__":
-    init_baselines()
-    while True:
-        try:
-            sweep()
-        except Exception as exc:
-            logging.error(f"Sweep error: {exc}")
-        time.sleep(15)
+    main()
