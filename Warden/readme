@@ -1,21 +1,66 @@
-﻿# WARDEN — CCDC Linux Defense & Forensic Quarantine Suite
+﻿### Quick Start (Competition Day Deployment)
 
-Automated competition-day Linux hardening, persistent `nftables` firewall enforcement (default-deny inbound & outbound), and continuous intrusion monitoring (`warden.service`) with an interactive admin CLI (`gatekeeper`) and automated Incident Report (IR) forensic packet generation.
+Run as `root` (or with `sudo`) on each Linux machine (`Rocky Ecom .10`, `Ubuntu Email .15`, `Debian Splunk .20`):
 
-## Repository Files (`CCDC-Test/Warden/`)
-* **`setup.py`** — **Run this first.** Auto-detects the host profile (`rocky`, `ubuntu`, `debian`), rotates `sysadmin` and `root` passwords, masks `ufw`/`firewalld`, enforces `gatekeeper_fw.sh`, initializes `/opt/warden/warden.db`, configures the Splunk Universal Forwarder (with interactive Indexer IP/port prompts), and installs `warden.service` and `gatekeeper`.
-* **`gatekeeper_fw.sh`** — Bootstraps `nftables` with default-drop inbound and outbound policies, ICMP ping support (Rule 12), and reboot persistence on both Debian/Ubuntu (`/etc/nftables.conf`) and Rocky/RHEL (`/etc/sysconfig/nftables.conf`).
-* **`warden_daemon.py`** — Background service (`/usr/bin/warden_daemon.py`) that freezes (`SIGSTOP`) active reverse-shell/C2 processes instead of destroying evidence, generates ready-to-submit Incident Report bundles in `/opt/warden/quarantine/`, locks unauthorized accounts, reverts `/etc/crontab` tampering (saving evidence first), and monitors shell binary SHA-256 integrity.
-* **`gatekeeper.py`** — Interactive CLI (`/usr/bin/gatekeeper`) for banning Red Team IPs/CIDRs, whitelisting Blue Team jump hosts, opening/closing inject ports, and flagging rogue users or services live.
-* **`warden.service`** — Systemd unit file installed to `/etc/systemd/system/warden.service`.
+```
+git clone https://github.com/thomasbrady10-cyber/CCDC-Test.git /opt/CCDC-Test
+cd /opt/CCDC-Test/Warden
+sudo python3 setup.py
+
+```
+
+#### Deployment Prompts
+
+1. **OS Profile Confirmation:** Press **Enter** to accept the auto-detected OS profile (`rocky`, `ubuntu`, or `debian`).
+2. **Password Rotation:** Input new, unique passwords for `sysadmin` and `root`.
+3. **Splunk Forwarder Target:** *(Prompted on Rocky Ecom &amp; Ubuntu Email; automatically skipped on Debian Splunk Indexer)*  
+  * Press **Enter** to accept default Indexer IP (`172.20.240.20`) and port (`9997`), or supply custom endpoints.
+  * Provide Splunk Forwarder credentials (or press **Enter** for default `admin`).
+
+#### Targeted Flag Executions
+
+To re-run specific components without performing a full setup:
+
+```
+sudo python3 setup.py --passwords   # Rotate root &amp; sysadmin passwords only (-p)
+sudo python3 setup.py --firewall    # Re-apply gatekeeper_fw.sh only (-f)
+sudo python3 setup.py --splunk      # Reconfigure Splunk forwarder target/monitors (-s)
+sudo python3 setup.py --verify      # Run post-deploy service health checks (-v)
+
+```
+
+#### Verification
+
+```
+sudo systemctl status warden.service nftables.service
+sudo nft list ruleset
+tail -f /opt/warden/warden.log
+
+```
 
 ---
 
-## Quick Start (Competition Day)
+### Live Defense CLI (`sudo gatekeeper`)
 
-### 1. Clone & Deploy (Run First)
-Run as `root` (or with `sudo`) on each Linux server (`Rocky Ecom .10`, `Ubuntu Email .15`, `Debian Splunk .20`):
-```bash
-git clone [https://github.com/thomasbrady10-cyber/CCDC-Test.git](https://github.com/thomasbrady10-cyber/CCDC-Test.git) /opt/CCDC-Test
-cd /opt/CCDC-Test/Warden
-sudo python3 setup.py
+Launch the interactive management tool from any terminal on the machine:
+
+```
+sudo gatekeeper
+
+```
+
+1. **Ban Malicious IP / CIDR:** Immediately appends target IP to `@blacklist` set and drops inbound traffic.
+2. **Whitelist Trusted IP / CIDR:** Adds trusted Blue Team jump hosts to `@whitelist`.
+3. **Open Port (TCP/UDP):** Opens temporary ports for inject requirements.
+4. **Close Port:** Removes port exceptions and reloads ruleset.
+5. **Lock Rogue User:** Flags user for locking (`usermod -L -s /sbin/nologin`) and session termination.
+6. **Quarantine Rogue Service:** Stops, disables, masks, and moves target service unit to `/opt/warden/quarantine/`.
+7. **View Policy &amp; Firewall Status:** Displays all allowed ports, blacklisted/whitelisted IPs, and blocked users/services.
+
+---
+
+### Forensic Quarantine &amp; Incident Response (IR) Workflow
+
+When `warden_daemon.py` detects an unauthorized socket (e.g., `bash`, `sh`, `nc`, `python3`, `perl`, `php` holding an established TCP connection to an external address):
+
+1. **Process Freezing (`SIGSTOP`):** The process is immediately frozen in memory rather than killed, halting outbound beacons while preserving `/proc/
