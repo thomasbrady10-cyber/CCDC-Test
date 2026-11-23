@@ -7,7 +7,7 @@ PURPOSE:
     Runs continuously in the background as a systemd service (`warden.service`),
     sweeping the host every 15 seconds for Red Team persistence and active C2.
 
-FIVE DEFENSIVE SWEEPS PER CYCLE:
+SIX DEFENSIVE SWEEPS PER CYCLE:
     1. User Audit:       Locks any newly created UID 0, GID 0, or login user not
                          present in the initial baseline or allowed_users table.
     2. SSH Login Audit:  Logs all new SSH logins for Incident Reports and kills
@@ -20,6 +20,9 @@ FIVE DEFENSIVE SWEEPS PER CYCLE:
                          the injected payload for IR, and restores the baseline.
     5. Unit Quarantine:  Stops, disables, and moves any flagged systemd service
                          file into /opt/warden/quarantine/.
+    6. Shell Integrity:  Detects symlink, hard-link (inode), or SHA-256 hash
+                         tampering on /bin/bash, /bin/sh, /sbin/nologin,
+                         /bin/false, and all shells in /etc/shells.
 ================================================================================
 """
 
@@ -28,6 +31,7 @@ import re
 import time
 import signal
 import shutil
+import hashlib
 import sqlite3
 import logging
 import subprocess
@@ -55,10 +59,26 @@ SUSPICIOUS_SHELL_BINARIES = {
 # (Add your Splunk Indexer IP here if Splunk runs custom alert scripts)
 TRUSTED_OUTBOUND_IPS = {"127.0.0.1", "::1"}
 
+# Interactive shells that grant command execution
+INTERACTIVE_SHELLS = {
+    "/bin/bash", "/usr/bin/bash",
+    "/bin/sh", "/usr/bin/sh",
+    "/bin/dash", "/usr/bin/dash",
+    "/bin/zsh", "/usr/bin/zsh",
+}
+
+# Restricted shells meant to block interactive logins for service accounts
+RESTRICTED_SHELLS = {
+    "/sbin/nologin", "/usr/sbin/nologin",
+    "/bin/false", "/usr/bin/false",
+}
+
 # In-memory baselines captured when the daemon starts
 baseline_users = set()
 baseline_crontab = ""
+baseline_shell_hashes = {}
 seen_logins = set()
+alerted_shell_anomalies = set()
 
 
 def run_cmd(cmd):
@@ -77,18 +97,51 @@ def get_passwd():
     return users
 
 
+def get_monitored_shells():
+    """Collect all interactive, restricted, and /etc/shells paths present on disk."""
+    shells = set(INTERACTIVE_SHELLS | RESTRICTED_SHELLS)
+    etc_shells = Path("/etc/shells")
+    if etc_shells.is_file():
+        for line in etc_shells.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                shells.add(line)
+    return sorted(shells)
+
+
+def hash_file(path_str):
+    """Return SHA-256 hex digest of a file, or None if missing/unreadable."""
+    try:
+        h = hashlib.sha256()
+        with open(path_str, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
 def init_baselines():
-    """Snapshot known-good /etc/passwd accounts and /etc/crontab contents at boot."""
-    global baseline_users, baseline_crontab
+    """Snapshot known-good /etc/passwd, /etc/crontab, and shell binary hashes at boot."""
+    global baseline_users, baseline_crontab, baseline_shell_hashes
     baseline_users = set(get_passwd().keys())
+
     cron = Path("/etc/crontab")
     if cron.is_file():
         baseline_crontab = cron.read_text()
-    logging.info(f"Baselines captured ({len(baseline_users)} users).")
+
+    for sp in get_monitored_shells():
+        digest = hash_file(sp)
+        if digest:
+            baseline_shell_hashes[sp] = digest
+
+    logging.info(
+        f"Baselines captured ({len(baseline_users)} users, {len(baseline_shell_hashes)} shell binaries)."
+    )
 
 
 def sweep():
-    """Execute one full 5-part defensive audit cycle."""
+    """Execute one full 6-part defensive audit cycle."""
     global seen_logins
 
     # Reload dynamic policies from SQLite on every sweep so `gatekeeper` CLI
@@ -210,6 +263,69 @@ def sweep():
                     shutil.move(str(unit_path), str(QUARANTINE_DIR / unit))
                 run_cmd(["systemctl", "daemon-reload"])
                 logging.error(f"QUARANTINED malicious service unit: {unit}")
+
+    # --------------------------------------------------------------------------
+    # 6. SHELL BINARY, SYMLINK, HARD-LINK & SHA-256 HASH INTEGRITY CHECK
+    # --------------------------------------------------------------------------
+    # Catches Red Team persistence where /sbin/nologin or /bin/false is symlinked,
+    # hard-linked (same inode), or overwritten with /bin/bash or /bin/sh.
+    interactive_hashes = {}
+    interactive_inodes = {}
+
+    for sp in INTERACTIVE_SHELLS:
+        p = Path(sp)
+        if p.exists():
+            digest = hash_file(sp)
+            if digest:
+                interactive_hashes[digest] = sp
+            st = p.stat()
+            interactive_inodes[(st.st_dev, st.st_ino)] = sp
+
+    for sp in get_monitored_shells():
+        p = Path(sp)
+        if not p.exists():
+            continue
+
+        # A. Detect symlink tampering (e.g., /sbin/nologin -> /bin/bash)
+        if p.is_symlink():
+            resolved = str(p.resolve())
+            if sp in RESTRICTED_SHELLS and resolved in INTERACTIVE_SHELLS:
+                key = f"symlink:{sp}->{resolved}"
+                if key not in alerted_shell_anomalies:
+                    alerted_shell_anomalies.add(key)
+                    logging.error(
+                        f"CRITICAL SHELL TAMPER (SYMLINK): {sp} points to interactive shell {resolved}!"
+                    )
+
+        # B. Detect hard links (shared inode) or binary copies replacing nologin/false
+        st = p.stat()
+        digest = hash_file(sp)
+        if sp in RESTRICTED_SHELLS:
+            inode_key = (st.st_dev, st.st_ino)
+            if inode_key in interactive_inodes:
+                key = f"hardlink:{sp}=={interactive_inodes[inode_key]}"
+                if key not in alerted_shell_anomalies:
+                    alerted_shell_anomalies.add(key)
+                    logging.error(
+                        f"CRITICAL SHELL TAMPER (HARD LINK): {sp} shares inode {st.st_ino} with {interactive_inodes[inode_key]}!"
+                    )
+            elif digest and digest in interactive_hashes:
+                key = f"hashmatch:{sp}=={interactive_hashes[digest]}"
+                if key not in alerted_shell_anomalies:
+                    alerted_shell_anomalies.add(key)
+                    logging.error(
+                        f"CRITICAL SHELL TAMPER (HASH MATCH): {sp} has identical SHA-256 ({digest[:16]}...) to {interactive_hashes[digest]}!"
+                    )
+
+        # C. Detect post-deploy binary modification against initial startup baseline
+        if sp in baseline_shell_hashes and digest and digest != baseline_shell_hashes[sp]:
+            key = f"modified:{sp}:{digest}"
+            if key not in alerted_shell_anomalies:
+                alerted_shell_anomalies.add(key)
+                logging.error(
+                    f"CRITICAL SHELL MODIFIED: {sp} SHA-256 changed from "
+                    f"{baseline_shell_hashes[sp][:16]}... to {digest[:16]}...!"
+                )
 
 
 if __name__ == "__main__":
